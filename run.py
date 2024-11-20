@@ -8,7 +8,7 @@ from binary import Binarization
 from modelutils import find_layers
 
 
-def get_model(model):
+def get_model(model, debug_flag=False):
     import torch
 
     def skip(*args, **kwargs):
@@ -26,6 +26,15 @@ def get_model(model):
         from transformers import LlamaForCausalLM
 
         model = LlamaForCausalLM.from_pretrained(model, torch_dtype="auto")
+        
+        model.seqlen = 2048
+    elif "mistralai" in model:
+        from transformers import AutoModelForCausalLM
+
+        print('getting model')
+        model = AutoModelForCausalLM.from_pretrained(model, torch_dtype="auto")
+        if debug_flag:
+            print(model)
         model.seqlen = 2048
     return model
 
@@ -34,7 +43,7 @@ def get_model(model):
 The function is employed to calibrate and quantize models layer by layer.
 '''
 @torch.no_grad()
-def quant_sequential(model, dataloader, dev):
+def quant_sequential(model, dataloader, dev, debug_flag=False):
     print("Starting ...")
 
     for name, module in model.named_modules():
@@ -63,11 +72,22 @@ def quant_sequential(model, dataloader, dev):
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+    elif "mistralai" in args.model:
+        if debug_flag:
+            print('=' * 50)
+            print(vars(model))
+            print('=' * 50)
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    pos_ids = torch.zeros(
+        (args.nsamples, 1, model.seqlen), dtype=torch.int16, device=dev
     )
     cache = {"i": 0, "attention_mask": None}
 
@@ -77,7 +97,10 @@ def quant_sequential(model, dataloader, dev):
             self.module = module
 
         def forward(self, inp, **kwargs):
+            if debug_flag:
+                print(kwargs)
             inps[cache["i"]] = inp
+            pos_ids[cache["i"]] = kwargs["position_ids"]
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
             raise ValueError
@@ -105,6 +128,9 @@ def quant_sequential(model, dataloader, dev):
         ):
             model.model.decoder.project_in = model.model.decoder.project_in.cpu()
     elif "llama" in args.model:
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+        model.model.norm = model.model.norm.cpu()
+    elif "mistralai" in args.model:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
@@ -147,7 +173,15 @@ def quant_sequential(model, dataloader, dev):
         for name in gptq:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            if args.device == 'cpu':
+                inps = inps.type(torch.float32)
+                if attention_mask:
+                    attention_mask = attention_mask.type(torch.float32)
+                layer = layer.type(torch.float32)
+            # transformer 4.45 required position_ids instead of attention mask
+            outs[j] = layer(inps[j].unsqueeze(0), position_ids=pos_ids[j])[0]
+            if debug_flag:
+                print('out at {} is {}'.format(j, outs[j]))
         for h in handles:
             h.remove()
 
@@ -161,7 +195,8 @@ def quant_sequential(model, dataloader, dev):
             gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            # transformer 4.45 required position_ids instead of attention mask
+            outs[j] = layer(inps[j].unsqueeze(0), position_ids=pos_ids[j])[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -256,6 +291,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_wandb", action="store_true", help="Whether to log to wandb."
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="test new catcher"
+    )
 
     args = parser.parse_args()
     groupsize = args.blocksize
@@ -267,7 +305,7 @@ if __name__ == "__main__":
         model = get_model(save_file)
         model.eval()
     else: # braq
-        model = get_model(args.model)
+        model = get_model(args.model, args.debug)
         model.eval()
         tick = time.time()
         dataloader, testloader = get_loaders(
@@ -277,7 +315,7 @@ if __name__ == "__main__":
             model=args.model,
             seqlen=model.seqlen,
         )
-        quant_sequential(model, dataloader, device)
+        quant_sequential(model, dataloader, device, args.debug)
         print("quantization time:", time.time() - tick, "s")
 
     if args.save:
@@ -299,3 +337,7 @@ if __name__ == "__main__":
             from eval_ppl_utils import llama_eval
 
             llama_eval(model, testloader, device, dataset, args.log_wandb)
+        elif "mistralai" in args.model:
+            from eval_ppl_utils import mistralai_eval
+
+            mistralai_eval(model, testloader, device, dataset, args.log_wandb)

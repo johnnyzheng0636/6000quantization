@@ -1,5 +1,19 @@
 # BiLLM: Pushing the Limit of Post-Training Quantization for LLMs [[PDF]](https://arxiv.org/pdf/2402.04291.pdf)
 
+# update for 6000 understanding of LLMs
+
+update the python packge to the latest version as of 20/11/2024 for python 3.10.15, for the detail packages please see the requirements.txt
+
+This project add support for Mistral series of LLMs.
+
+To reproduce in superpod, run
+
+```
+sbatch -o out/plus_test.out job/plus_test.sbatch
+```
+
+you will found the model in /output and Perplexity results in /out
+
 ![intuition](imgs/author.png)
 
 **<sup>1</sup>The University of Hong Kong <sup>2 </sup>Beihang University <sup> 3</sup>ETH  Zürich**
