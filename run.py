@@ -7,7 +7,6 @@ from bigptq import BRAGPTQ
 from binary import Binarization
 from modelutils import find_layers
 
-
 def get_model(model, debug_flag=False):
     import torch
 
@@ -28,7 +27,7 @@ def get_model(model, debug_flag=False):
         model = LlamaForCausalLM.from_pretrained(model, torch_dtype="auto")
         
         model.seqlen = 2048
-    elif "mistralai" in model:
+    elif "mistralai" in model or "Mistral" in model:
         from transformers import AutoModelForCausalLM
 
         print('getting model')
@@ -43,7 +42,7 @@ def get_model(model, debug_flag=False):
 The function is employed to calibrate and quantize models layer by layer.
 '''
 @torch.no_grad()
-def quant_sequential(model, dataloader, dev, debug_flag=False):
+def quant_sequential(model, dataloader, dev, debug_flag=False, double_quan=False, twobit=False):
     print("Starting ...")
 
     for name, module in model.named_modules():
@@ -72,7 +71,7 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-    elif "mistralai" in args.model:
+    elif "mistralai" in args.model or "Mistral" in args.model:
         if debug_flag:
             print('=' * 50)
             print(vars(model))
@@ -87,7 +86,7 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
         (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     pos_ids = torch.zeros(
-        (args.nsamples, 1, model.seqlen), dtype=torch.int16, device=dev
+        (args.nsamples, 1, model.seqlen), dtype=torch.int, device=dev
     )
     cache = {"i": 0, "attention_mask": None}
 
@@ -97,8 +96,8 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
             self.module = module
 
         def forward(self, inp, **kwargs):
-            if debug_flag:
-                print(kwargs)
+            # if debug_flag:
+            #     print(kwargs)
             inps[cache["i"]] = inp
             pos_ids[cache["i"]] = kwargs["position_ids"]
             cache["i"] += 1
@@ -130,7 +129,7 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
     elif "llama" in args.model:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
-    elif "mistralai" in args.model:
+    elif "mistralai" in args.model or "Mistral" in args.model:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     torch.cuda.empty_cache()
@@ -143,16 +142,31 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
     for i in range(len(layers)):
         layer = layers[i].to(dev)
 
-        subset = find_layers(layer)
+        if double_quan:
+            from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear
+            subset = find_layers(layer, layers=[QuantLinear])  
+        else:
+            subset = find_layers(layer)
+
+        if debug_flag:
+            print("subset: ", subset)
+            print("layer: ", layer)
 
         gptq = {}
         for name in subset:
+            # if debug_flag:
+            #     print(name)
             if (
                 not (args.minlayer <= i < args.maxlayer and args.quant_only in name)
             ) == (not args.invert):
                 continue
+            if double_quan:
+                current_subset_weight = torch.zeros(subset[name].outfeatures, subset[name].infeatures)
+            else:
+                current_subset_weight = subset[name].weight
+
             braq_quantizer = Binarization(
-                subset[name].weight,
+                current_subset_weight,
                 method=args.low_quant_method,
                 groupsize=groupsize,
             )
@@ -161,7 +175,11 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
                 braq_quantizer,
                 salient_metric=args.salient_metric,
                 disable_gptq=args.disable_gptq,
+                double_quan=double_quan,
             )
+        
+        # if debug_flag:
+        #     print(gptq)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -181,17 +199,29 @@ def quant_sequential(model, dataloader, dev, debug_flag=False):
             # transformer 4.45 required position_ids instead of attention mask
             outs[j] = layer(inps[j].unsqueeze(0), position_ids=pos_ids[j])[0]
             if debug_flag:
-                print('out at {} is {}'.format(j, outs[j]))
+                print('out at layer {} sample {} is {}'.format(i, j, outs[j]))
+
+        # if debug_flag:
+        #     print(handles)
+        #     print(gptq)
+
         for h in handles:
             h.remove()
 
         for name in gptq:
             print(i, name)
             print("Quantizing ...")
-            info = gptq[name].fasterquant(
-                percdamp=args.percdamp, 
-                blocksize=args.blocksize,
-            )
+            if twobit:
+                info = gptq[name].fasterquant(
+                    percdamp=args.percdamp, 
+                    blocksize=args.blocksize,
+                    orders=(2,2,2),
+                )
+            else:
+                info = gptq[name].fasterquant(
+                    percdamp=args.percdamp, 
+                    blocksize=args.blocksize,
+                )
             gptq[name].free()
 
         for j in range(args.nsamples):
@@ -294,6 +324,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug", action="store_true", help="test new catcher"
     )
+    parser.add_argument(
+        "--double_quan", action="store_true", help="qunatize a GPTQ model due to limited GPU"
+    )
+    parser.add_argument(
+        "--twobit", action="store_true", help="apply resquan globally"
+    )
 
     args = parser.parse_args()
     groupsize = args.blocksize
@@ -315,7 +351,7 @@ if __name__ == "__main__":
             model=args.model,
             seqlen=model.seqlen,
         )
-        quant_sequential(model, dataloader, device, args.debug)
+        quant_sequential(model, dataloader, device, args.debug, args.double_quan, args.twobit)
         print("quantization time:", time.time() - tick, "s")
 
     if args.save:
@@ -337,7 +373,7 @@ if __name__ == "__main__":
             from eval_ppl_utils import llama_eval
 
             llama_eval(model, testloader, device, dataset, args.log_wandb)
-        elif "mistralai" in args.model:
+        elif "mistralai" in args.model or "Mistral" in args.model:
             from eval_ppl_utils import mistralai_eval
 
             mistralai_eval(model, testloader, device, dataset, args.log_wandb)

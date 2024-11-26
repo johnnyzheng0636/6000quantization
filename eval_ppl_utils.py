@@ -22,7 +22,7 @@ def mistralai_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
         (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     pos_ids = torch.zeros(
-        (nsamples, 1, model.seqlen), dtype=torch.int16, device=dev
+        (nsamples, 1, model.seqlen), dtype=torch.int, device=dev
     )
     cache = {"i": 0, "attention_mask": None}
 

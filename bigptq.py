@@ -4,6 +4,7 @@ from exceptiongroup import catch
 import torch
 import torch.nn as nn
 import transformers
+from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear
 from utils.structure import structural_guassian_distribution
 
 DEBUG = False
@@ -17,17 +18,26 @@ BRAGPTQ uses structural mask to distinguish outliers and other data, and takes a
 '''
 class BRAGPTQ:
     def __init__(
-        self, layer, braq_quantizer,salient_metric, disable_gptq=False
+        self, layer, braq_quantizer,salient_metric, disable_gptq=False, double_quan=False
     ):
         self.layer = layer
-        self.dev = self.layer.weight.device
-        W = layer.weight.data.clone()
+        self.double_quan = double_quan
+        if double_quan:
+            self.dev = self.layer.qweight.device
+            W = layer.qweight.data.clone()
+        else:
+            self.dev = self.layer.weight.device
+            W = layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
-        self.rows = W.shape[0]
-        self.columns = W.shape[1]
+        if double_quan:
+            self.rows = layer.outfeatures
+            self.columns = layer.infeatures
+        else:
+            self.rows = W.shape[0]
+            self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
         self.braq_quantizer = braq_quantizer
@@ -43,14 +53,20 @@ class BRAGPTQ:
         tmp = inp.shape[0]
         if isinstance(self.layer, nn.Linear) or isinstance(
             self.layer, transformers.Conv1D
+        ) or isinstance(
+            self.layer, QuantLinear
         ):
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
+        # print(self.H.shape, self.nsamples, tmp)
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
+        # print(self.H.shape, self.nsamples)
         inp = math.sqrt(2 / self.nsamples) * inp.float()
+        # print(self.H.shape, inp.shape, inp.t().shape)
         self.H += inp.matmul(inp.t())
+        # print(self.H.shape)
         # breakpoint()
 
     def fasterquant(self,
@@ -59,7 +75,10 @@ class BRAGPTQ:
                     partition=3, 
                     orders=(1,1,2),
                     ):
-        W = self.layer.weight.data.clone()
+        if self.double_quan:
+            W = self.layer.weight.data.clone()
+        else:
+            W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(self.layer, transformers.Conv1D):
@@ -146,8 +165,12 @@ class BRAGPTQ:
                 W[:, col_ed:] -= Err1.matmul(Hinv[col_st:col_ed, col_ed:])
 
                 if DEBUG:
-                    self.layer.weight.data[:, :col_ed] = W[:, :col_ed]
-                    self.layer.weight.data[:, col_ed:] = W[:, col_ed:]
+                    if self.double_quan:
+                        self.layer.qweight.data[:, :col_ed] = W[:, :col_ed]
+                        self.layer.qweight.data[:, col_ed:] = W[:, col_ed:]
+                    else:
+                        self.layer.weight.data[:, :col_ed] = W[:, :col_ed]
+                        self.layer.weight.data[:, col_ed:] = W[:, col_ed:]
                     print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
                     print(torch.sum(Losses))
 
@@ -157,9 +180,14 @@ class BRAGPTQ:
 
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
-        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
-        )
+        if self.double_quan:
+            self.layer.qweight.data = W.reshape(self.layer.qweight.shape).to(
+                self.layer.qweight.data.dtype
+            )
+        else:
+            self.layer.weight.data = W.reshape(self.layer.weight.shape).to(
+                self.layer.weight.data.dtype
+            )
         if DEBUG:
             print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
